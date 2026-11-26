@@ -45,6 +45,15 @@ def gps_a_pixel(lat, lon, bbox, ancho, alto):
     y = int((bbox["lat_max"] - lat) / (bbox["lat_max"] - bbox["lat_min"]) * alto)
     return max(0, min(ancho - 1, x)), max(0, min(alto - 1, y))
 
+def descargar_imagen_valida(url, timeout=12):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=timeout, verify=False)
+    if r.status_code == 200 and len(r.content) > 2000:
+        img = Image.open(BytesIO(r.content))
+        img.load()
+        return img.convert("RGB")
+    return None
+
 def analizar_pixeles(img_rgb, box):
     recorte = img_rgb.crop(box)
     pixeles = list(recorte.getdata())
@@ -71,8 +80,6 @@ def analizar_pixeles(img_rgb, box):
     return "🟢 *NULA* (Sin ecos significativos en radar)"
 
 def obtener_imagen_radar(lat, lon):
-    headers = {"User-Agent": "Mozilla/5.0"}
-
     if esta_en_mendoza(lat, lon):
         urls_mendoza = [
             "https://www2.contingencias.mendoza.gov.ar/radar/web/img/mosaico.png",
@@ -80,9 +87,9 @@ def obtener_imagen_radar(lat, lon):
         ]
         for url in urls_mendoza:
             try:
-                r = requests.get(url, headers=headers, timeout=10)
-                if r.status_code == 200 and len(r.content) > 2000:
-                    return Image.open(BytesIO(r.content)).convert("RGB"), "Red MRL5 Contingencias Mendoza", BBOX_MENDOZA
+                img = descargar_imagen_valida(url, timeout=10)
+                if img:
+                    return img, "Red MRL5 Contingencias Mendoza", BBOX_MENDOZA
             except Exception:
                 pass
 
@@ -97,22 +104,32 @@ def obtener_imagen_radar(lat, lon):
     if radar_cercano:
         url_smn = f"https://www.smn.gob.ar/sites/default/files/radares/{radar_cercano['codigo']}_CMAX.png"
         try:
-            r = requests.get(url_smn, headers=headers, timeout=10)
-            if r.status_code == 200 and len(r.content) > 2000:
+            img = descargar_imagen_valida(url_smn, timeout=10)
+            if img:
                 bbox_rad = {
                     "lat_max": radar_cercano["lat"] + 2.2,
                     "lat_min": radar_cercano["lat"] - 2.2,
                     "lon_min": radar_cercano["lon"] - 2.6,
                     "lon_max": radar_cercano["lon"] + 2.6,
                 }
-                return Image.open(BytesIO(r.content)).convert("RGB"), f"{radar_cercano['nombre']} (a {int(menor_dist)} km)", bbox_rad
+                return img, f"{radar_cercano['nombre']} (a {int(menor_dist)} km)", bbox_rad
         except Exception:
             pass
 
-    url_goes = "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/13/1200x1200.jpg"
-    r = requests.get(url_goes, headers=headers, timeout=15)
+    urls_goes = [
+        "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/13/1200x1200.jpg",
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ssa/13/1200x1200.jpg"
+    ]
     bbox_ssa = {"lat_max": -18.0, "lat_min": -56.0, "lon_min": -78.0, "lon_max": -48.0}
-    return Image.open(BytesIO(r.content)).convert("RGB"), "Satélite GOES-19 (Respaldo Infrarrojo)", bbox_ssa
+    for url_goes in urls_goes:
+        try:
+            img = descargar_imagen_valida(url_goes, timeout=15)
+            if img:
+                return img, "Satélite GOES (Respaldo Infrarrojo)", bbox_ssa
+        except Exception:
+            pass
+
+    raise RuntimeError("Los servidores de radar y satélite no devolvieron imágenes válidas en este momento.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     boton = KeyboardButton(text="📍 Consultar granizo en mi ubicación", request_location=True)
@@ -158,7 +175,7 @@ async def recibir_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draw.ellipse((px - radio_px, py - radio_px, px + radio_px, py + radio_px), outline="#00FFFF", width=3)
         draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill="#00FFFF")
 
-        if "GOES-19" in fuente:
+        if "GOES" in fuente:
             zoom = 180
             img = img.crop((max(0, px-zoom), max(0, py-zoom), min(ancho, px+zoom), min(alto, py+zoom)))
 
