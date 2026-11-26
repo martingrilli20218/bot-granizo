@@ -17,25 +17,6 @@ BBOX_MENDOZA = {
     "lon_max": -66.4
 }
 
-RADARES_SMN = [
-    {"nombre": "Radar SMN Córdoba", "codigo": "RMA1", "lat": -31.44, "lon": -64.19, "radio_km": 240},
-    {"nombre": "Radar SMN Ezeiza (Bs. As.)", "codigo": "RMA2", "lat": -34.82, "lon": -58.53, "radio_km": 240},
-    {"nombre": "Radar SMN Las Lajitas (Salta)", "codigo": "RMA3", "lat": -24.73, "lon": -64.20, "radio_km": 240},
-    {"nombre": "Radar SMN Resistencia (Chaco)", "codigo": "RMA4", "lat": -27.45, "lon": -59.05, "radio_km": 240},
-    {"nombre": "Radar SMN Mar del Plata", "codigo": "RMA6", "lat": -37.93, "lon": -57.58, "radio_km": 240},
-    {"nombre": "Radar SMN Neuquén", "codigo": "RMA7", "lat": -38.95, "lon": -68.14, "radio_km": 240},
-    {"nombre": "Radar SMN Paraná (Entre Ríos)", "codigo": "PAR", "lat": -31.85, "lon": -60.53, "radio_km": 240},
-    {"nombre": "Radar SMN Pergamino (Bs. As.)", "codigo": "PER", "lat": -33.94, "lon": -60.56, "radio_km": 240},
-    {"nombre": "Radar SMN Anguil (La Pampa)", "codigo": "ANG", "lat": -36.54, "lon": -63.99, "radio_km": 240},
-]
-
-def distancia_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
 def esta_en_mendoza(lat, lon):
     return (BBOX_MENDOZA["lat_min"] <= lat <= BBOX_MENDOZA["lat_max"] and
             BBOX_MENDOZA["lon_min"] <= lon <= BBOX_MENDOZA["lon_max"])
@@ -46,9 +27,12 @@ def gps_a_pixel(lat, lon, bbox, ancho, alto):
     return max(0, min(ancho - 1, x)), max(0, min(alto - 1, y))
 
 def descargar_imagen_valida(url, timeout=12):
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "image/png,image/jpeg,image/*,*/*;q=0.8"
+    }
     r = requests.get(url, headers=headers, timeout=timeout, verify=False)
-    if r.status_code == 200 and len(r.content) > 2000:
+    if r.status_code == 200 and len(r.content) > 1500:
         img = Image.open(BytesIO(r.content))
         img.load()
         return img.convert("RGB")
@@ -64,20 +48,28 @@ def analizar_pixeles(img_rgb, box):
     for r, g, b in pixeles:
         if r == g == b:
             continue
-        if r > 200 and g < 85 and b < 85:
+        if r > 190 and g < 85 and b < 85:
             granizo += 1
-        elif r > 215 and 110 <= g <= 215 and b < 70:
+        elif r > 210 and 100 <= g <= 215 and b < 70:
             tormenta += 1
-        elif g > 140 and r < 150 and b < 120:
+        elif (g > 135 and r < 150 and b < 130) or (b > 160 and r < 100):
             lluvia += 1
 
     if granizo >= 4:
         return "🔴 *ALTA* (Núcleos >55 dBZ — posible granizo)"
-    elif tormenta >= 10:
+    elif tormenta >= 8:
         return "🟠 *MEDIA-ALTA* (Tormenta en formación / 45–55 dBZ)"
-    elif lluvia >= 20 or tormenta >= 2:
+    elif lluvia >= 15 or tormenta >= 2:
         return "🟡 *BAJA* (Lluvia moderada / celdas aisladas)"
     return "🟢 *NULA* (Sin ecos significativos en radar)"
+
+def obtener_tile_rainviewer(lat, lon):
+    api = requests.get("https://api.rainviewer.com/public/weather-maps.json", timeout=10).json()
+    host = api["host"]
+    ultimo_radar = api["radar"]["past"][-1]["path"]
+    url_tile = f"{host}{ultimo_radar}/512/6/{lat}/{lon}/2/1_1.png"
+    img = descargar_imagen_valida(url_tile, timeout=12)
+    return img
 
 def obtener_imagen_radar(lat, lon):
     if esta_en_mendoza(lat, lon):
@@ -87,49 +79,34 @@ def obtener_imagen_radar(lat, lon):
         ]
         for url in urls_mendoza:
             try:
-                img = descargar_imagen_valida(url, timeout=10)
+                img = descargar_imagen_valida(url, timeout=8)
                 if img:
-                    return img, "Red MRL5 Contingencias Mendoza", BBOX_MENDOZA
+                    return img, "Red MRL5 Contingencias Mendoza", BBOX_MENDOZA, True
             except Exception:
                 pass
 
-    radar_cercano = None
-    menor_dist = 9999
-    for rad in RADARES_SMN:
-        d = distancia_km(lat, lon, rad["lat"], rad["lon"])
-        if d < rad["radio_km"] and d < menor_dist:
-            menor_dist = d
-            radar_cercano = rad
-
-    if radar_cercano:
-        url_smn = f"https://www.smn.gob.ar/sites/default/files/radares/{radar_cercano['codigo']}_CMAX.png"
-        try:
-            img = descargar_imagen_valida(url_smn, timeout=10)
-            if img:
-                bbox_rad = {
-                    "lat_max": radar_cercano["lat"] + 2.2,
-                    "lat_min": radar_cercano["lat"] - 2.2,
-                    "lon_min": radar_cercano["lon"] - 2.6,
-                    "lon_max": radar_cercano["lon"] + 2.6,
-                }
-                return img, f"{radar_cercano['nombre']} (a {int(menor_dist)} km)", bbox_rad
-        except Exception:
-            pass
+    try:
+        img = obtener_tile_rainviewer(lat, lon)
+        if img:
+            return img, "Radar Meteorológico Global (RainViewer)", None, False
+    except Exception:
+        pass
 
     urls_goes = [
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ssa/13/1200x1200.jpg",
         "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/13/1200x1200.jpg",
-        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ssa/13/1200x1200.jpg"
+        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ssa/GEOCOLOR/1200x1200.jpg"
     ]
     bbox_ssa = {"lat_max": -18.0, "lat_min": -56.0, "lon_min": -78.0, "lon_max": -48.0}
     for url_goes in urls_goes:
         try:
-            img = descargar_imagen_valida(url_goes, timeout=15)
+            img = descargar_imagen_valida(url_goes, timeout=12)
             if img:
-                return img, "Satélite GOES (Respaldo Infrarrojo)", bbox_ssa
+                return img, "Satélite GOES (Infrarrojo / GeoColor)", bbox_ssa, True
         except Exception:
             pass
 
-    raise RuntimeError("Los servidores de radar y satélite no devolvieron imágenes válidas en este momento.")
+    raise RuntimeError("No se pudo conectar con ninguno de los servidores meteorológicos en este momento.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     boton = KeyboardButton(text="📍 Consultar granizo en mi ubicación", request_location=True)
@@ -147,11 +124,15 @@ async def recibir_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_espera = await update.message.reply_text("🛰️ Escaneando radares y satélite en tu zona...")
 
     try:
-        img, fuente, bbox = obtener_imagen_radar(lat, lon)
+        img, fuente, bbox, usar_bbox = obtener_imagen_radar(lat, lon)
         ancho, alto = img.size
-        px, py = gps_a_pixel(lat, lon, bbox, ancho, alto)
 
-        radio_px = max(25, int(ancho * 0.045))
+        if usar_bbox and bbox:
+            px, py = gps_a_pixel(lat, lon, bbox, ancho, alto)
+        else:
+            px, py = ancho // 2, alto // 2
+
+        radio_px = max(35, int(ancho * 0.08))
         box_entorno = (
             max(0, px - radio_px),
             max(0, py - radio_px),
