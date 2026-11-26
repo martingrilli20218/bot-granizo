@@ -12,117 +12,143 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", 10000))
-
-BBOX_MENDOZA = {
-    "lat_max": -32.0,
-    "lat_min": -36.6,
-    "lon_min": -70.6,
-    "lon_max": -66.4
-}
-
-def esta_en_mendoza(lat, lon):
-    return (BBOX_MENDOZA["lat_min"] <= lat <= BBOX_MENDOZA["lat_max"] and
-            BBOX_MENDOZA["lon_min"] <= lon <= BBOX_MENDOZA["lon_max"])
+RADIO_KM = 50.0
 
 def gps_a_pixel(lat, lon, bbox, ancho, alto):
     x = int((lon - bbox["lon_min"]) / (bbox["lon_max"] - bbox["lon_min"]) * ancho)
     y = int((bbox["lat_max"] - lat) / (bbox["lat_max"] - bbox["lat_min"]) * alto)
     return max(0, min(ancho - 1, x)), max(0, min(alto - 1, y))
 
-def gps_a_tile_xy(lat, lon, zoom):
+def gps_a_tile_xy_y_offset(lat, lon, zoom):
     lat_rad = math.radians(lat)
     n = 2.0 ** zoom
-    xtile = int((lon + 180.0) / 360.0 * n)
-    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-    return xtile, ytile
+    xtile_float = (lon + 180.0) / 360.0 * n
+    ytile_float = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+    xtile = int(xtile_float)
+    ytile = int(ytile_float)
+    px = int((xtile_float - xtile) * 256)
+    py = int((ytile_float - ytile) * 256)
+    return xtile, ytile, px, py
 
-def descargar_imagen_valida(url, timeout=12):
+def descargar_imagen_valida(url, timeout=12, min_bytes=50):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
     }
     r = requests.get(url, headers=headers, timeout=timeout, verify=False)
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}")
-    if len(r.content) < 500:
-        raise RuntimeError(f"Archivo muy chico ({len(r.content)} bytes)")
+    if len(r.content) < min_bytes:
+        raise RuntimeError(f"Archivo vacío ({len(r.content)} bytes)")
     img = Image.open(BytesIO(r.content))
     img.load()
     return img.convert("RGBA")
 
-def analizar_pixeles(img_rgb, box):
-    recorte = img_rgb.crop(box)
-    pixeles = list(recorte.getdata())
+def analizar_pixeles(img_rgb, cx, cy, radio_px, modo="radar"):
+    ancho, alto = img_rgb.size
+    x0 = max(0, cx - radio_px)
+    y0 = max(0, cy - radio_px)
+    x1 = min(ancho, cx + radio_px)
+    y1 = min(alto, cy + radio_px)
+
     granizo = 0
     tormenta = 0
     lluvia = 0
+    r2 = radio_px * radio_px
 
-    for r, g, b in pixeles:
-        if r == g == b:
-            continue
-        if r > 190 and g < 85 and b < 85:
-            granizo += 1
-        elif r > 210 and 100 <= g <= 215 and b < 70:
-            tormenta += 1
-        elif (g > 135 and r < 150 and b < 130) or (b > 160 and r < 100):
-            lluvia += 1
+    for y in range(y0, y1):
+        dy = y - cy
+        for x in range(x0, x1):
+            dx = x - cx
+            if dx * dx + dy * dy > r2:
+                continue
+            r, g, b = img_rgb.getpixel((x, y))
+            if r == g == b:
+                continue
+            if modo == "satelite":
+                if (r > 180 and b < 80 and g < 120) or (b > 170 and r > 130 and g < 90):
+                    granizo += 1
+                elif r > 200 and g > 140 and b < 70:
+                    tormenta += 1
+                elif g > 140 and b > 140 and r < 110:
+                    lluvia += 1
+            else:
+                if r > 190 and g < 85 and b < 85:
+                    granizo += 1
+                elif r > 210 and 100 <= g <= 215 and b < 70:
+                    tormenta += 1
+                elif (g > 135 and r < 150 and b < 130) or (b > 160 and r < 100):
+                    lluvia += 1
 
     if granizo >= 4:
-        return "🔴 *ALTA* (Núcleos >55 dBZ — posible granizo)"
+        return "🔴 *ALTA* (Topes nubosos muy fríos / >55 dBZ — posible granizo)"
     elif tormenta >= 8:
-        return "🟠 *MEDIA-ALTA* (Tormenta en formación / 45–55 dBZ)"
+        return "🟠 *MEDIA-ALTA* (Tormenta convectiva activa / 45–55 dBZ)"
     elif lluvia >= 15 or tormenta >= 2:
-        return "🟡 *BAJA* (Lluvia moderada / celdas aisladas)"
-    return "🟢 *NULA* (Sin ecos significativos en radar)"
+        return "🟡 *BAJA* (Nubosidad con precipitación moderada / celdas aisladas)"
+    return "🟢 *NULA* (Cielo despejado o sin ecos significativos en la zona)"
 
-def obtener_mapa_rainviewer_zxy(lat, lon):
+def obtener_mapa_rainviewer_centrado(lat, lon):
     zoom = 7
-    tx, ty = gps_a_tile_xy(lat, lon, zoom)
+    tx, ty, ox, oy = gps_a_tile_xy_y_offset(lat, lon, zoom)
     api = requests.get("https://api.rainviewer.com/public/weather-maps.json", timeout=10).json()
     host = api["host"]
     ultimo_radar = api["radar"]["past"][-1]["path"]
 
-    url_mapa = f"https://tile.openstreetmap.org/{zoom}/{tx}/{ty}.png"
-    url_radar = f"{host}{ultimo_radar}/256/{zoom}/{tx}/{ty}/2/1_1.png"
+    mosaico_base = Image.new("RGBA", (768, 768))
+    mosaico_radar = Image.new("RGBA", (768, 768))
 
-    base = descargar_imagen_valida(url_mapa, timeout=10).resize((512, 512))
-    capa_radar = descargar_imagen_valida(url_radar, timeout=10).resize((512, 512))
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            url_mapa = f"https://tile.openstreetmap.org/{zoom}/{tx + dx}/{ty + dy}.png"
+            url_radar = f"{host}{ultimo_radar}/256/{zoom}/{tx + dx}/{ty + dy}/2/1_1.png"
+            tile_m = descargar_imagen_valida(url_mapa, timeout=10, min_bytes=200)
+            tile_r = descargar_imagen_valida(url_radar, timeout=10, min_bytes=50)
+            mosaico_base.paste(tile_m, ((dx + 1) * 256, (dy + 1) * 256))
+            mosaico_radar.paste(tile_r, ((dx + 1) * 256, (dy + 1) * 256))
 
-    combinada = Image.alpha_composite(base, capa_radar)
-    return combinada.convert("RGB"), capa_radar.convert("RGB")
+    cx_total = 256 + ox
+    cy_total = 256 + oy
+    mitad = 256
+
+    recorte_base = mosaico_base.crop((cx_total - mitad, cy_total - mitad, cx_total + mitad, cy_total + mitad))
+    recorte_radar = mosaico_radar.crop((cx_total - mitad, cy_total - mitad, cx_total + mitad, cy_total + mitad))
+
+    km_por_pixel = (156543.03392 * math.cos(math.radians(lat)) / (2 ** zoom)) / 1000.0
+    radio_px = max(10, int(round(RADIO_KM / km_por_pixel)))
+
+    combinada = Image.alpha_composite(recorte_base, recorte_radar)
+    return combinada.convert("RGB"), recorte_radar.convert("RGB"), "Radar Meteorológico (RainViewer + Mapa)", mitad, mitad, radio_px, "radar"
 
 def obtener_imagen_radar(lat, lon):
     errores = []
 
-    if esta_en_mendoza(lat, lon):
-        urls_mendoza = [
-            "https://www2.contingencias.mendoza.gov.ar/radar/web/img/mosaico.png",
-            "https://www2.contingencias.mendoza.gov.ar/radar/web/img/mosaico_g.png"
-        ]
-        for url in urls_mendoza:
-            try:
-                img = descargar_imagen_valida(url, timeout=8).convert("RGB")
-                return img, img, "Red MRL5 Contingencias Mendoza", BBOX_MENDOZA, True
-            except Exception as e:
-                errores.append(f"Mendoza: {e}")
-
     try:
-        img_visual, img_analisis = obtener_mapa_rainviewer_zxy(lat, lon)
-        return img_visual, img_analisis, "Radar Meteorológico (RainViewer + Mapa)", None, False
+        return obtener_mapa_rainviewer_centrado(lat, lon)
     except Exception as e:
         errores.append(f"RainViewer: {e}")
 
     urls_goes = [
-        "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/SECTOR/ssa/13/1200x1200.jpg",
-        "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/13/1200x1200.jpg"
+        ("https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/13/latest.jpg", "Satélite GOES-19 Infrarrojo (Topes Nubosos)"),
+        ("https://cdn.star.nesdis.noaa.gov/GOES19/ABI/SECTOR/ssa/GEOCOLOR/latest.jpg", "Satélite GOES-19 Color Real")
     ]
     bbox_ssa = {"lat_max": -18.0, "lat_min": -56.0, "lon_min": -78.0, "lon_max": -48.0}
-    for url_goes in urls_goes:
+    for url_goes, nombre_goes in urls_goes:
         try:
-            img = descargar_imagen_valida(url_goes, timeout=12).convert("RGB")
-            return img, img, "Satélite GOES (Infrarrojo)", bbox_ssa, True
+            img = descargar_imagen_valida(url_goes, timeout=12, min_bytes=1000).convert("RGB")
+            ancho, alto = img.size
+            px, py = gps_a_pixel(lat, lon, bbox_ssa, ancho, alto)
+            km_por_pixel = ((bbox_ssa["lat_max"] - bbox_ssa["lat_min"]) * 111.32) / alto
+            radio_px = max(10, int(round(RADIO_KM / km_por_pixel)))
+            zoom_crop = max(180, radio_px + 60)
+            x0 = max(0, px - zoom_crop)
+            y0 = max(0, py - zoom_crop)
+            x1 = min(ancho, px + zoom_crop)
+            y1 = min(alto, py + zoom_crop)
+            recorte = img.crop((x0, y0, x1, y1))
+            return recorte, recorte, nombre_goes, px - x0, py - y0, radio_px, "satelite"
         except Exception as e:
-            errores.append(f"GOES: {e}")
+            errores.append(f"GOES-19: {e}")
 
     raise RuntimeError(" | ".join(errores))
 
@@ -130,8 +156,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     boton = KeyboardButton(text="📍 Consultar granizo en mi ubicación", request_location=True)
     teclado = ReplyKeyboardMarkup([[boton]], resize_keyboard=True)
     await update.message.reply_text(
-        "👋 *Radar de Tormentas y Granizo listo.*\n\n"
-        "Tocá el botón de abajo para enviarme tu ubicación GPS y analizar los radares disponibles en tu zona.",
+        f"👋 *Radar de Tormentas y Granizo listo.*\n\n"
+        f"Tocá el botón de abajo para enviarme tu ubicación GPS y analizar un radio exacto de *{int(RADIO_KM)} km a la redonda*.",
         parse_mode="Markdown",
         reply_markup=teclado
     )
@@ -139,44 +165,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def recibir_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lat = update.message.location.latitude
     lon = update.message.location.longitude
-    msg_espera = await update.message.reply_text("🛰️ Escaneando radares y satélite en tu zona...")
+    msg_espera = await update.message.reply_text(f"🛰️ Escaneando radares en un radio de {int(RADIO_KM)} km...")
 
     try:
-        img_visual, img_analisis, fuente, bbox, usar_bbox = obtener_imagen_radar(lat, lon)
-        ancho, alto = img_visual.size
-
-        if usar_bbox and bbox:
-            px, py = gps_a_pixel(lat, lon, bbox, ancho, alto)
-        else:
-            px, py = ancho // 2, alto // 2
-
-        radio_px = max(35, int(ancho * 0.08))
-        box_entorno = (
-            max(0, px - radio_px),
-            max(0, py - radio_px),
-            min(ancho, px + radio_px),
-            min(alto, py + radio_px)
-        )
-
-        estado_entorno = analizar_pixeles(img_analisis, box_entorno)
-
-        detalle_zonas = ""
-        if esta_en_mendoza(lat, lon) and fuente.startswith("Red MRL5"):
-            zonas = {
-                "Oasis Norte y Este": (int(ancho*0.50), int(alto*0.15), int(ancho*0.80), int(alto*0.35)),
-                "Valle de Uco": (int(ancho*0.38), int(alto*0.35), int(ancho*0.60), int(alto*0.52)),
-                "Oasis Sur": (int(ancho*0.45), int(alto*0.55), int(ancho*0.82), int(alto*0.85)),
-            }
-            lineas = [f"• *{nombre}:* {analizar_pixeles(img_analisis, z_box)}" for nombre, z_box in zonas.items()]
-            detalle_zonas = "\n\n🗺️ *Actividad por zonas en Mendoza:*\n" + "\n".join(lineas)
+        img_visual, img_analisis, fuente, px, py, radio_px, modo = obtener_imagen_radar(lat, lon)
+        estado_entorno = analizar_pixeles(img_analisis, px, py, radio_px, modo=modo)
 
         draw = ImageDraw.Draw(img_visual)
-        draw.ellipse((px - radio_px, py - radio_px, px + radio_px, py + radio_px), outline="#00FFFF", width=3)
-        draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill="#00FFFF")
-
-        if "GOES" in fuente:
-            zoom = 180
-            img_visual = img_visual.crop((max(0, px-zoom), max(0, py-zoom), min(ancho, px+zoom), min(alto, py+zoom)))
+        draw.ellipse((px - radio_px, py - radio_px, px + radio_px, py + radio_px), outline="#0077FF", width=3)
+        draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill="#FF0000")
 
         buf = BytesIO()
         img_visual.save(buf, format="PNG")
@@ -184,8 +181,8 @@ async def recibir_ubicacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         caption = (
             f"📡 *Fuente:* {fuente}\n"
-            f"📍 *Tu entorno (~25 km):*\n{estado_entorno}"
-            f"{detalle_zonas}"
+            f"📍 *Radio analizado:* {int(RADIO_KM)} km a la redonda\n"
+            f"⛈️ *Actividad detectada:*\n{estado_entorno}"
         )
         await msg_espera.delete()
         await update.message.reply_photo(photo=buf, caption=caption, parse_mode="Markdown")
